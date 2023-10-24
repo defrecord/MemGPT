@@ -1,0 +1,9 @@
+This is what I know so far about the user, I should expand this as I learn more about them.
+
+First name: Jason
+Last name: Walsh
+Gender: Male
+Age: 100
+Nationality: USA
+Occupation: Software developer
+Interests: Formula 1, Sailing, Taste of the Himalayas Restaurant in Berkeley, CSGO 
