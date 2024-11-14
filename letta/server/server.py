@@ -65,7 +65,6 @@ from letta.schemas.embedding_config import EmbeddingConfig
 
 # openai schemas
 from letta.schemas.enums import JobStatus
-from letta.schemas.file import FileMetadata
 from letta.schemas.job import Job
 from letta.schemas.letta_message import LettaMessage
 from letta.schemas.llm_config import LLMConfig
@@ -78,12 +77,13 @@ from letta.schemas.memory import (
 from letta.schemas.message import Message, MessageCreate, MessageRole, UpdateMessage
 from letta.schemas.organization import Organization
 from letta.schemas.passage import Passage
-from letta.schemas.source import Source, SourceCreate, SourceUpdate
+from letta.schemas.source import Source
 from letta.schemas.tool import Tool, ToolCreate
 from letta.schemas.usage import LettaUsageStatistics
 from letta.schemas.user import User
 from letta.services.agents_tags_manager import AgentsTagsManager
 from letta.services.organization_manager import OrganizationManager
+from letta.services.source_manager import SourceManager
 from letta.services.tool_manager import ToolManager
 from letta.services.user_manager import UserManager
 from letta.utils import create_random_username, json_dumps, json_loads
@@ -249,6 +249,7 @@ class SyncServer(Server):
         self.organization_manager = OrganizationManager()
         self.user_manager = UserManager()
         self.tool_manager = ToolManager()
+        self.source_manager = SourceManager()
         self.agents_tags_manager = AgentsTagsManager()
 
         # Make default user and org
@@ -1511,12 +1512,16 @@ class SyncServer(Server):
         if self.ms.get_agent(agent_id=agent_id, user_id=user_id) is None:
             raise ValueError(f"Agent agent_id={agent_id} does not exist")
 
-        # Verify that the agent exists and is owned by the user
+        # Verify that the agent exists and belongs to the org of the user
         agent_state = self.ms.get_agent(agent_id=agent_id, user_id=user_id)
         if not agent_state:
             raise ValueError(f"Could not find agent_id={agent_id} under user_id={user_id}")
-        if agent_state.user_id != user_id:
-            raise ValueError(f"Could not authorize agent_id={agent_id} with user_id={user_id}")
+
+        agent_state_user = self.user_manager.get_user_by_id(user_id=agent_state.user_id)
+        if agent_state_user.organization_id != actor.organization_id:
+            raise ValueError(
+                f"Could not authorize agent_id={agent_id} with user_id={user_id} because of differing organizations; agent_id was created in {agent_state_user.organization_id} while user belongs to {actor.organization_id}. How did they get the agent id?"
+            )
 
         # First, if the agent is in the in-memory cache we should remove it
         # List of {'user_id': user_id, 'agent_id': agent_id, 'agent': agent_obj} dicts
@@ -1560,44 +1565,12 @@ class SyncServer(Server):
         self.ms.delete_api_key(api_key=api_key)
         return api_key_obj
 
-    def create_source(self, request: SourceCreate, user_id: str) -> Source:  # TODO: add other fields
-        """Create a new data source"""
-        source = Source(
-            name=request.name,
-            user_id=user_id,
-            embedding_config=self.list_embedding_models()[0],  # TODO: require providing this
-        )
-        self.ms.create_source(source)
-        assert self.ms.get_source(source_name=request.name, user_id=user_id) is not None, f"Failed to create source {request.name}"
-        return source
-
-    def update_source(self, request: SourceUpdate, user_id: str) -> Source:
-        """Update an existing data source"""
-        if not request.id:
-            existing_source = self.ms.get_source(source_name=request.name, user_id=user_id)
-        else:
-            existing_source = self.ms.get_source(source_id=request.id)
-        if not existing_source:
-            raise ValueError("Source does not exist")
-
-        # override updated fields
-        if request.name:
-            existing_source.name = request.name
-        if request.metadata_:
-            existing_source.metadata_ = request.metadata_
-        if request.description:
-            existing_source.description = request.description
-
-        self.ms.update_source(existing_source)
-        return existing_source
-
-    def delete_source(self, source_id: str, user_id: str):
+    def delete_source(self, source_id: str, actor: User):
         """Delete a data source"""
-        source = self.ms.get_source(source_id=source_id, user_id=user_id)
-        self.ms.delete_source(source_id)
+        self.source_manager.delete_source(source_id=source_id, actor=actor)
 
         # delete data from passage store
-        passage_store = StorageConnector.get_storage_connector(TableType.PASSAGES, self.config, user_id=user_id)
+        passage_store = StorageConnector.get_storage_connector(TableType.PASSAGES, self.config, user_id=actor.id)
         passage_store.delete({"source_id": source_id})
 
         # TODO: delete data from agent passage stores (?)
@@ -1639,9 +1612,9 @@ class SyncServer(Server):
         # try:
         from letta.data_sources.connectors import DirectoryConnector
 
-        source = self.ms.get_source(source_id=source_id)
+        source = self.source_manager.get_source_by_id(source_id=source_id)
         connector = DirectoryConnector(input_files=[file_path])
-        num_passages, num_documents = self.load_data(user_id=source.user_id, source_name=source.name, connector=connector)
+        num_passages, num_documents = self.load_data(user_id=source.created_by_id, source_name=source.name, connector=connector)
         # except Exception as e:
         #    # job failed with error
         #    error = str(e)
@@ -1662,9 +1635,6 @@ class SyncServer(Server):
 
         return job
 
-    def delete_file_from_source(self, source_id: str, file_id: str, user_id: Optional[str]) -> Optional[FileMetadata]:
-        return self.ms.delete_file_from_source(source_id=source_id, file_id=file_id, user_id=user_id)
-
     def load_data(
         self,
         user_id: str,
@@ -1675,16 +1645,16 @@ class SyncServer(Server):
         # TODO: this should be implemented as a batch job or at least async, since it may take a long time
 
         # load data from a data source into the document store
-        source = self.ms.get_source(source_name=source_name, user_id=user_id)
+        user = self.user_manager.get_user_by_id(user_id=user_id)
+        source = self.source_manager.get_source_by_name(source_name=source_name, actor=user)
         if source is None:
             raise ValueError(f"Data source {source_name} does not exist for user {user_id}")
 
         # get the data connectors
         passage_store = StorageConnector.get_storage_connector(TableType.PASSAGES, self.config, user_id=user_id)
-        file_store = StorageConnector.get_storage_connector(TableType.FILES, self.config, user_id=user_id)
 
         # load data into the document store
-        passage_count, document_count = load_data(connector, source, passage_store, file_store)
+        passage_count, document_count = load_data(connector, source, passage_store, self.source_manager, actor=user)
         return passage_count, document_count
 
     def attach_source_to_agent(
@@ -1696,10 +1666,13 @@ class SyncServer(Server):
         source_name: Optional[str] = None,
     ) -> Source:
         # attach a data source to an agent
-        data_source = self.ms.get_source(source_id=source_id, user_id=user_id, source_name=source_name)
-        if data_source is None:
-            raise ValueError(f"Data source id={source_id} name={source_name} does not exist for user_id {user_id}")
-
+        user = self.user_manager.get_user_by_id(user_id=user_id)
+        if source_id:
+            data_source = self.source_manager.get_source_by_id(source_id=source_id, actor=user)
+        elif source_name:
+            data_source = self.source_manager.get_source_by_name(source_name=source_name, actor=user)
+        else:
+            raise ValueError(f"Need to provide at least source_id or source_name to find the source.")
         # get connection to data source storage
         source_connector = StorageConnector.get_storage_connector(TableType.PASSAGES, self.config, user_id=user_id)
 
@@ -1719,12 +1692,14 @@ class SyncServer(Server):
         source_id: Optional[str] = None,
         source_name: Optional[str] = None,
     ) -> Source:
-        if not source_id:
-            assert source_name is not None, "source_name must be provided if source_id is not"
-            source = self.ms.get_source(source_name=source_name, user_id=user_id)
-            source_id = source.id
+        user = self.user_manager.get_user_by_id(user_id=user_id)
+        if source_id:
+            source = self.source_manager.get_source_by_id(source_id=source_id, actor=user)
+        elif source_name:
+            source = self.source_manager.get_source_by_name(source_name=source_name, actor=user)
         else:
-            source = self.ms.get_source(source_id=source_id)
+            raise ValueError(f"Need to provide at least source_id or source_name to find the source.")
+        source_id = source.id
 
         # delete all Passage objects with source_id==source_id from agent's archival memory
         agent = self._get_or_load_agent(agent_id=agent_id)
@@ -1739,27 +1714,25 @@ class SyncServer(Server):
 
     def list_attached_sources(self, agent_id: str) -> List[Source]:
         # list all attached sources to an agent
-        return self.ms.list_attached_sources(agent_id)
+        source_ids = self.ms.list_attached_source_ids(agent_id)
 
-    def list_files_from_source(self, source_id: str, limit: int = 1000, cursor: Optional[str] = None) -> List[FileMetadata]:
-        # list all attached sources to an agent
-        return self.ms.list_files_from_source(source_id=source_id, limit=limit, cursor=cursor)
+        return [self.source_manager.get_source_by_id(source_id=id) for id in source_ids]
 
     def list_data_source_passages(self, user_id: str, source_id: str) -> List[Passage]:
         warnings.warn("list_data_source_passages is not yet implemented, returning empty list.", category=UserWarning)
         return []
 
-    def list_all_sources(self, user_id: str) -> List[Source]:
+    def list_all_sources(self, actor: User) -> List[Source]:
         """List all sources (w/ extra metadata) belonging to a user"""
 
-        sources = self.ms.list_sources(user_id=user_id)
+        sources = self.source_manager.list_sources(actor=actor)
 
         # Add extra metadata to the sources
         sources_with_metadata = []
         for source in sources:
 
             # count number of passages
-            passage_conn = StorageConnector.get_storage_connector(TableType.PASSAGES, self.config, user_id=user_id)
+            passage_conn = StorageConnector.get_storage_connector(TableType.PASSAGES, self.config, user_id=actor.id)
             num_passages = passage_conn.size({"source_id": source.id})
 
             # TODO: add when files table implemented
@@ -1773,7 +1746,7 @@ class SyncServer(Server):
             attached_agents = [
                 {
                     "id": str(a_id),
-                    "name": self.ms.get_agent(user_id=user_id, agent_id=a_id).name,
+                    "name": self.ms.get_agent(user_id=actor.id, agent_id=a_id).name,
                 }
                 for a_id in agent_ids
             ]
